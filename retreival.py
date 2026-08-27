@@ -91,7 +91,9 @@ class PineVectorStore:
 
         self.pc = Pinecone(api_key=pinecone_api_key)
         print("Loading BM25 encoder dictionary...")
-        self.bm25 = BM25Encoder.default()
+        self.bm25 = BM25Encoder() ## replaced this from deault , so that the ms macro disct is not downloaded 
+        # --- NEW FIX: Add a tiny dummy text so it's always "fitted" ---
+        self.bm25.fit(["dummy text to prevent unfitted encoder crash"])
 
     def ensure_index_exists(self, dimension: int):
         existing_indexes = [idx.name for idx in self.pc.list_indexes()]
@@ -258,6 +260,10 @@ def ingest_directory(vector_store: PineVectorStore, embedding_manager: Embedding
     chunks = split_docs(all_docs)
     if chunks:
         texts = [doc.page_content for doc in chunks]
+
+        # CHANGE HERE: Teach the BM25 encoder the vocabulary of your uploaded PDFs
+        print("Fitting BM25 dictionary to uploaded documents...")
+        vector_store.bm25.fit(texts)
         embeddings = embedding_manager.create_embeddings(texts)
         vector_store.add_documents(chunks, embeddings)
     return len(chunks) if chunks else 0
