@@ -44,8 +44,10 @@ def process_pdfs(pdf_directory: str):
     return pdf_documents
 
 
-def split_docs(documents, chunk_size: int = 1000, chunk_overlap: int = 200):
+def split_docs(documents, chunk_size: int = 1500, chunk_overlap: int = 200):
     """Splits loaded documents into overlapping chunks."""
+
+    print(f"Chunking : {chunk_size}")
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
