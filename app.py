@@ -107,6 +107,9 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
             raise HTTPException(status_code=400, detail="No text could be extracted from the uploaded PDF(s).")
 
         texts = [doc.page_content for doc in chunks]
+
+        # --- NEW FIX: Teach BM25 the real vocabulary of the PDF ---
+        vector_store.bm25.fit(texts)
         dense_embs = embedding_man.create_embeddings(texts)
         vector_store.add_documents(chunks, dense_embs)
 
