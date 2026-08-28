@@ -188,7 +188,7 @@ class RAGRetriever:
         self,
         query: str,
         top_k: int = 4,
-        candidate_top_k: int = 10
+        candidate_top_k: int = 20
     ) -> List[Dict[str, Any]]:
         index = self.vector_store.pc.Index(self.vector_store.index_name)
 
