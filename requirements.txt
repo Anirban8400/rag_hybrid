@@ -14,7 +14,6 @@ langchain-community>=0.2.0
 langchain-text-splitters>=0.2.0
 
 
-transformers>=4.40.0
 
 
 openai>=1.30.0
