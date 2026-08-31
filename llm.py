@@ -26,6 +26,7 @@ def rag_with_sources(
     retriever: RAGRetriever,
     client: OpenAI,
     model: str,
+    session_id: str,  # <-- 1. Added session_id parameter
     top_k: int = 4,
     chat_history: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
@@ -33,7 +34,8 @@ def rag_with_sources(
     if not model or not model.strip():
         raise ValueError("A valid model identifier is mandatory.")
 
-    results = retriever.retrieve(query=query, top_k=top_k)
+    # 2. Pass session_id to retrieve only from this user's namespace & BM25 model
+    results = retriever.retrieve(query=query, session_id=session_id, top_k=top_k)
 
     if chat_history is None:
         chat_history = []
@@ -61,6 +63,7 @@ Answer:"""
 
     print(f"\n--- EXECUTING LLM ---")
     print(f"Target Model: {model.strip()}")
+    print(f"Session ID: {session_id}")
     print(f"Retrieved Chunks: {len(results)}")
     print(f"---------------------\n")
 

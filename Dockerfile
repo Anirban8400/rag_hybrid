@@ -7,7 +7,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Only curl is needed now for the health check
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
@@ -17,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py retreival.py llm.py ./
 
-# Setup permissions (Removed the HF cache folder, kept NLTK)
+# Setup permission
 RUN useradd --create-home --shell /bin/bash appuser \
     && mkdir -p /app/temp_uploads /app/nltk_data \
     && chown -R appuser:appuser /app

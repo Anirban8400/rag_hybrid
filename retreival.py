@@ -1,23 +1,26 @@
 import os
+import pickle
 import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import requests
 from dotenv import load_dotenv
-
-load_dotenv()
-
 import numpy as np
+
 from pinecone import Pinecone, ServerlessSpec
 from pinecone_text.sparse import BM25Encoder
 
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+load_dotenv()
+
 BASE_DIR = Path(__file__).resolve().parent
+BM25_DIR = BASE_DIR / "bm25_models"
+BM25_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# --- 1. Document Ingestion & Splitting ---
+# Document Ingestion & Splitting 
 
 def process_pdfs(pdf_directory: str):
     """Loads all PDFs in a directory into LangChain Documents."""
@@ -46,8 +49,7 @@ def process_pdfs(pdf_directory: str):
 
 def split_docs(documents, chunk_size: int = 1500, chunk_overlap: int = 200):
     """Splits loaded documents into overlapping chunks."""
-
-    print(f"Chunking : {chunk_size}")
+    print(f"Chunking with size: {chunk_size}")
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -57,7 +59,7 @@ def split_docs(documents, chunk_size: int = 1500, chunk_overlap: int = 200):
     return text_splitter.split_documents(documents)
 
 
-# --- 2. Dense Embeddings (Hugging Face) ---
+#  Dense Embeddings (Hugging Face)
 
 class EmbeddingMan:
     def __init__(self, model_name: str = "google/embeddinggemma-300m"):
@@ -82,7 +84,7 @@ class EmbeddingMan:
         return np.array(embeddings_list)
 
 
-# --- 3. Pinecone Hybrid Vector Store (Dense + BM25 Sparse) ---
+# Pinecone Hybrid Vector Store
 
 class PineVectorStore:
     def __init__(self, index_name: str = "pdf-hybrid-index"):
@@ -92,10 +94,6 @@ class PineVectorStore:
             raise ValueError("PINECONE_API_KEY not found in environment variables.")
 
         self.pc = Pinecone(api_key=pinecone_api_key)
-        print("Loading BM25 encoder dictionary...")
-        self.bm25 = BM25Encoder() ## replaced this from deault , so that the ms macro disct is not downloaded 
-        # --- NEW FIX: Add a tiny dummy text so it's always "fitted" ---
-        self.bm25.fit(["dummy text to prevent unfitted encoder crash"])
 
     def ensure_index_exists(self, dimension: int):
         existing_indexes = [idx.name for idx in self.pc.list_indexes()]
@@ -109,34 +107,72 @@ class PineVectorStore:
             )
         return self.pc.Index(self.index_name)
 
-    def count(self) -> int:
+    def count(self, namespace: Optional[str] = None) -> int:
         try:
             index = self.pc.Index(self.index_name)
             stats = index.describe_index_stats()
+            if namespace:
+                return stats.namespaces.get(namespace, {}).get("vector_count", 0)
             return stats.total_vector_count or 0
         except Exception:
             return 0
 
-    def clear_database(self):
+    def clear_namespace(self, session_id: str):
+        """Wipes vectors only for the given user's session namespace."""
         try:
             index = self.pc.Index(self.index_name)
-            index.delete(delete_all=True)
-            print(f"Cleared all vectors from index '{self.index_name}'.")
+            index.delete(delete_all=True, namespace=session_id)
+            print(f"Cleared vectors in namespace '{session_id}'.")
         except Exception as e:
-            print(f"Note on clearing index: {e}")
+            print(f"Namespace note: {e}")
 
-    def add_documents(self, documents: List[Any], dense_embeddings: np.ndarray):
+    #  Per-User BM25 Serialization 
+
+    def _get_bm25_path(self, session_id: str) -> Path:
+        return BM25_DIR / f"{session_id}.pkl"
+
+    def fit_and_save_bm25(self, texts: List[str], session_id: str):
+        """Fits a BM25 model on the user's specific documents and pickles it to disk."""
+        bm25 = BM25Encoder()
+        bm25.fit(texts)
+        with open(self._get_bm25_path(session_id), "wb") as f:
+            pickle.dump(bm25, f)
+        print(f"Saved custom BM25 model for session: {session_id}")
+
+    def load_bm25(self, session_id: str) -> BM25Encoder:
+        """Loads the session-specific BM25 model from disk."""
+        path = self._get_bm25_path(session_id)
+        if not path.exists():
+            # Fallback encoder if query happens before upload
+            bm25 = BM25Encoder()
+            bm25.fit(["dummy text to prevent unfitted encoder crash"])
+            return bm25
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    def add_documents(
+        self,
+        documents: List[Any],
+        dense_embeddings: np.ndarray,
+        texts: List[str],
+        session_id: str
+    ):
         if len(documents) != len(dense_embeddings):
             raise ValueError("Document count does not match dense embedding count.")
 
+        # Fit & save isolated BM25 model for this session
+        self.fit_and_save_bm25(texts, session_id)
+        bm25 = self.load_bm25(session_id)
+
+        #  Prepare Pinecone Index & payloads
         dimension = len(dense_embeddings[0])
         index = self.ensure_index_exists(dimension)
 
         vectors_to_upsert = []
-        print("Generating BM25 sparse vectors and preparing upsert payloads...")
+        print(f"Generating sparse vectors for namespace '{session_id}'...")
 
         for i, (doc, dense_emb) in enumerate(zip(documents, dense_embeddings)):
-            sparse_emb = self.bm25.encode_documents(doc.page_content)
+            sparse_emb = bm25.encode_documents(doc.page_content)
 
             metadata = {
                 "source": str(doc.metadata.get("source", "unknown")),
@@ -144,27 +180,28 @@ class PineVectorStore:
                 "page": doc.metadata.get("page", None),
                 "doc_index": i,
                 "content_length": len(doc.page_content),
-                "text": doc.page_content
+                "text": doc.page_content,
             }
 
             vectors_to_upsert.append({
                 "id": f"doc_{uuid.uuid4().hex[:8]}_{i}",
                 "values": dense_emb.tolist(),
                 "sparse_values": sparse_emb,
-                "metadata": metadata
+                "metadata": metadata,
             })
 
+        # Upsert in batches into the user's namespace
         batch_size = 100
         for i in range(0, len(vectors_to_upsert), batch_size):
             batch = vectors_to_upsert[i:i + batch_size]
-            index.upsert(vectors=batch)
-            print(f"Upserted batch {i // batch_size + 1}")
+            index.upsert(vectors=batch, namespace=session_id)
+            print(f"Upserted batch {i // batch_size + 1} to namespace '{session_id}'")
 
 
 VectorStore = PineVectorStore
 
 
-# --- 4. Hybrid Retriever + Cloud API Cross-Encoder Reranker ---
+# Hybrid Retriever + Cross-Encoder Reranker
 
 class RAGRetriever:
     def __init__(
@@ -176,8 +213,7 @@ class RAGRetriever:
         self.vector_store = vector_store
         self.embedding_manager = embedding_manager
         self.reranker_model_name = reranker_model_name
-        
-        # Connect directly to Hugging Face Inference API for the reranker
+
         self.api_url = f"https://router.huggingface.co/hf-inference/models/{self.reranker_model_name}"
         token = os.environ.get("HF_API_TOKEN")
         if not token:
@@ -187,20 +223,24 @@ class RAGRetriever:
     def retrieve(
         self,
         query: str,
+        session_id: str,
         top_k: int = 4,
-        candidate_top_k: int = 10
+        candidate_top_k: int = 20
     ) -> List[Dict[str, Any]]:
         index = self.vector_store.pc.Index(self.vector_store.index_name)
 
-        # 1. Generate Query Embeddings (Dense & Sparse)
+        #Generate Query Embeddings (Dense & Session-Specific BM25 Sparse)
         query_dense = self.embedding_manager.create_embeddings([query])[0].tolist()
-        query_sparse = self.vector_store.bm25.encode_queries(query)
+        
+        bm25 = self.vector_store.load_bm25(session_id)
+        query_sparse = bm25.encode_queries(query)
 
-        # 2. Hybrid Search on Pinecone
+        #Hybrid Search restricted to user namespace
         hybrid_response = index.query(
             vector=query_dense,
             sparse_vector=query_sparse,
             top_k=candidate_top_k,
+            namespace=session_id,  # Strictly isolated search
             include_metadata=True
         )
 
@@ -210,23 +250,19 @@ class RAGRetriever:
 
         # 3. Cloud API Cross-Encoder Reranking
         print(f"Reranking candidates via Hugging Face API ({self.reranker_model_name})...")
-        
-        # Format payload for Hugging Face Cross-Encoder text classification
+
         payload = {
             "inputs": [{"text": query, "text_pair": match["metadata"]["text"]} for match in matches]
         }
-        
+
         try:
             response = requests.post(self.api_url, headers=self.headers, json=payload)
             response.raise_for_status()
             api_results = response.json()
-            
+
             cross_scores = []
             for res in api_results:
-                # HF classification API usually returns a list of dictionaries per input pair
-                # We extract the score safely, assuming the model returns a direct score or standard label format.
                 if isinstance(res, list) and len(res) > 0 and "score" in res[0]:
-                    # Find the score for 'LABEL_1' (relevant), fallback to the highest class score
                     positive_score = next((cls["score"] for cls in res if cls.get("label") == "LABEL_1"), res[0]["score"])
                     cross_scores.append(float(positive_score))
                 elif isinstance(res, dict) and "score" in res:
@@ -235,10 +271,9 @@ class RAGRetriever:
                     cross_scores.append(res)
                 else:
                     cross_scores.append(0.0)
-                    
+
         except Exception as e:
             print(f"Reranker API failed or timed out: {e}. Falling back to default Pinecone scores.")
-            # If the API fails (e.g. rate limits or model is loading), fallback gracefully to Pinecone scores
             cross_scores = [float(match.get("score", 0.0)) for match in matches]
 
         candidates = []
@@ -254,18 +289,3 @@ class RAGRetriever:
         # Sort descending by cross-encoder score
         candidates.sort(key=lambda x: x["cross_encoder_score"], reverse=True)
         return candidates[:top_k]
-
-
-def ingest_directory(vector_store: PineVectorStore, embedding_manager: EmbeddingMan, directory: str) -> int:
-    """Convenience helper: load -> split -> embed -> upsert."""
-    all_docs = process_pdfs(directory)
-    chunks = split_docs(all_docs)
-    if chunks:
-        texts = [doc.page_content for doc in chunks]
-
-        # CHANGE HERE: Teach the BM25 encoder the vocabulary of your uploaded PDFs
-        print("Fitting BM25 dictionary to uploaded documents...")
-        vector_store.bm25.fit(texts)
-        embeddings = embedding_manager.create_embeddings(texts)
-        vector_store.add_documents(chunks, embeddings)
-    return len(chunks) if chunks else 0

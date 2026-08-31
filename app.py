@@ -1,5 +1,6 @@
 import os
 import shutil
+import tempfile  # <-- NEW: For isolated file uploads
 from pathlib import Path
 from typing import List, Optional
 from contextlib import asynccontextmanager
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Hybrid RAG API", lifespan=lifespan)
 
 
-# --- Pydantic Schemas ---
+# Pydantic Schemas 
 
 class ChatMessage(BaseModel):
     role: str
@@ -52,6 +53,7 @@ class ChatMessage(BaseModel):
 class AskRequest(BaseModel):
     text: str
     model: str
+    session_id: str  # <-- NEW: Required field
     top_k: int = 4
     chat_history: List[ChatMessage] = []
 
@@ -69,7 +71,7 @@ class AskResponse(BaseModel):
     sources: List[SourceDoc]
 
 
-# --- Endpoints ---
+#  Endpoints 
 
 @app.get("/health")
 def health_check():
@@ -79,50 +81,50 @@ def health_check():
     }
 
 
-@app.post("/upload")
-async def upload_pdfs(files: List[UploadFile] = File(...)):
+# NEW: Route now requires session_id in the URL path
+@app.post("/upload/{session_id}")
+def upload_pdfs(session_id: str, files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    temp_dir = Path("./temp_uploads")
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    # NEW: Creates a unique, strictly isolated temporary directory for THIS user's request
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dir_path = Path(temp_dir)
 
-    try:
-        # 1. Reset vector store
-        vector_store.clear_database()
+        try:
+            # 1. Reset ONLY this user's namespace, not the global database
+            vector_store.clear_namespace(session_id)
 
-        # 2. Save uploaded files
-        saved_paths = []
-        for file in files:
-            dest_path = temp_dir / file.filename
-            with open(dest_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            saved_paths.append(dest_path)
+            # 2. Save uploaded files to the isolated folder
+            saved_paths = []
+            for file in files:
+                dest_path = dir_path / file.filename
+                with open(dest_path, "wb") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+                saved_paths.append(dest_path)
 
-        # 3. Process, embed, and store
-        docs = process_pdfs(str(temp_dir))
-        chunks = split_docs(docs)
+            # 3. Process, embed, and store
+            docs = process_pdfs(str(dir_path))
+            chunks = split_docs(docs)
 
-        if not chunks:
-            raise HTTPException(status_code=400, detail="No text could be extracted from the uploaded PDF(s).")
+            if not chunks:
+                raise HTTPException(status_code=400, detail="No text could be extracted.")
 
-        texts = [doc.page_content for doc in chunks]
+            texts = [doc.page_content for doc in chunks]
+            dense_embs = embedding_man.create_embeddings(texts)
+            
+            # 4. Pass session_id to properly isolate BM25 and Pinecone
+            vector_store.add_documents(chunks, dense_embs, texts, session_id)
 
-        # --- NEW FIX: Teach BM25 the real vocabulary of the PDF ---
-        vector_store.bm25.fit(texts)
-        dense_embs = embedding_man.create_embeddings(texts)
-        vector_store.add_documents(chunks, dense_embs)
+            return {
+                "status": "success",
+                "files_processed": len(saved_paths),
+                "chunks_created": len(chunks)
+            }
 
-        return {
-            "status": "success",
-            "files_processed": len(saved_paths),
-            "chunks_created": len(chunks)
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}") from e
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}") from e
+        # The 'with' block automatically deletes the temp_dir when finished.
 
 
 @app.post("/ask_with_source", response_model=AskResponse)
@@ -141,6 +143,7 @@ def ask_text(request: AskRequest):
             client=ai_client,
             model=request.model.strip(),
             top_k=request.top_k,
+            session_id=request.session_id,  # <-- NEW: Pass session down to the LLM/Retriever
             chat_history=hist_dicts,
         )
         return AskResponse(**answer)

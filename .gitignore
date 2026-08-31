@@ -14,3 +14,5 @@ venv/
 data/vector_store/
 temp_uploads/
 .env
+
+bm25_models/
