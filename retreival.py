@@ -224,7 +224,7 @@ class RAGRetriever:
         self,
         query: str,
         session_id: str,
-        top_k: int = 4,
+        top_k: int,
         candidate_top_k: int = 20
     ) -> List[Dict[str, Any]]:
         index = self.vector_store.pc.Index(self.vector_store.index_name)

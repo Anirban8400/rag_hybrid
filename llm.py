@@ -27,7 +27,7 @@ def rag_with_sources(
     client: OpenAI,
     model: str,
     session_id: str,  # <-- 1. Added session_id parameter
-    top_k: int = 4,
+    top_k: int,
     chat_history: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Retrieves context via hybrid + rerank, generates answer, and returns formatted metadata."""
